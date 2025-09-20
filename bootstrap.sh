@@ -6,7 +6,19 @@ BASE="/workspace"                 # RunPod persistent volume
 APP_DIR="/opt/ComfyUI"
 MODELS="$BASE/models"
 
-# ---- Prepare persistent model tree + link into ComfyUI ----
+echo "[init] ComfyUI bootstrap starting… (no GGUF)"
+
+# ------------------------------------------------------------
+# Ensure ComfyUI exists (defensive; Dockerfile should clone it)
+# ------------------------------------------------------------
+if [ ! -d "$APP_DIR" ]; then
+  echo "[warn] /opt/ComfyUI not found; cloning now"
+  git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git "$APP_DIR"
+fi
+
+# ------------------------------------------------------------
+# Persistent model tree + link into ComfyUI
+# ------------------------------------------------------------
 mkdir -p "$MODELS"/{checkpoints,loras,vae,clip,text_encoders,clip_vision,upscale_models,controlnet}
 ln -sfn "$MODELS/checkpoints"     "$APP_DIR/models/checkpoints"
 ln -sfn "$MODELS/loras"           "$APP_DIR/models/loras"
@@ -17,13 +29,46 @@ ln -sfn "$MODELS/clip_vision"     "$APP_DIR/models/clip_vision"
 ln -sfn "$MODELS/upscale_models"  "$APP_DIR/models/upscale_models"
 ln -sfn "$MODELS/controlnet"      "$APP_DIR/models/controlnet"
 
-# ---- Download helpers ----
+# ------------------------------------------------------------
+# Custom nodes required by the workflow
+# ------------------------------------------------------------
+mkdir -p "$APP_DIR/custom_nodes"
+cd "$APP_DIR/custom_nodes"
+
+if [ ! -d ComfyUI-Manager ]; then
+  git clone --depth=1 https://github.com/ltdrdata/ComfyUI-Manager
+fi
+if [ ! -d ComfyUI-VideoHelperSuite ]; then
+  git clone --depth=1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
+fi
+
+# (Add other node packs here if your workflow needs them)
+# Example:
+# if [ ! -d ComfyUI-Impact-Pack ]; then
+#   git clone --depth=1 https://github.com/ltdrdata/ComfyUI-Impact-Pack
+# fi
+
+# ------------------------------------------------------------
+# Install python requirements (ComfyUI + each custom node)
+# ------------------------------------------------------------
+cd "$APP_DIR"
+python3 -m pip install --no-cache-dir -r requirements.txt || true
+# Install any requirements.txt inside custom_nodes
+while IFS= read -r req; do
+  echo "[pip] installing deps for $req"
+  python3 -m pip install --no-cache-dir -r "$req" || true
+done < <(find custom_nodes -maxdepth 2 -name "requirements.txt" -type f)
+
+# ------------------------------------------------------------
+# Download helpers
+# ------------------------------------------------------------
 dl_url() { # dl_url <URL> <DEST_PATH>
   local url="$1"; local out="$2"
   if [ ! -f "$out" ]; then
     echo "[dl_url] $url -> $out"
     mkdir -p "$(dirname "$out")"
-    aria2c -q -x16 -s16 -k1M --file-allocation=none -o "$(basename "$out")" -d "$(dirname "$out")" "$url"
+    aria2c -q -x16 -s16 -k1M --file-allocation=none \
+      -o "$(basename "$out")" -d "$(dirname "$out")" "$url"
   else
     echo "[skip] $out exists"
   fi
@@ -40,32 +85,46 @@ dl_hf() { # dl_hf <REPO_ID> <FILENAME> <DEST_PATH> [REV]
 import os, sys
 from pathlib import Path
 from huggingface_hub import hf_hub_download
+
 repo, fname, out, rev = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 Path(os.path.dirname(out)).mkdir(parents=True, exist_ok=True)
-p = hf_hub_download(repo_id=repo, filename=fname, revision=rev, local_dir=os.path.dirname(out), local_dir_use_symlinks=False)
-# ensure final name exactly matches 'out'
+p = hf_hub_download(
+    repo_id=repo, filename=fname, revision=rev,
+    local_dir=os.path.dirname(out), local_dir_use_symlinks=False,
+    token=os.environ.get("HF_TOKEN")
+)
+# rename/move to exact target filename if needed
 if os.path.abspath(p) != os.path.abspath(out):
-    if os.path.exists(out): os.remove(out)
+    if os.path.exists(out):
+        os.remove(out)
     os.replace(p, out)
 print("ok:", out)
 PY
 }
 
-# ---- Your default model set (edit/extend) ----
-# Hugging Face items (repo | filename | target path relative to $MODELS)
-dl_hf "comfyanonymous/flux_text_encoders" "clip_l.safetensors"     "$MODELS/text_encoders/clip_l.safetensors"
-dl_hf "comfyanonymous/flux_text_encoders" "t5xxl_fp16.safetensors" "$MODELS/text_encoders/t5xxl_fp16.safetensors"
-dl_hf "stabilityai/sdxl-vae"              "sdxl_vae.safetensors"   "$MODELS/vae/sdxl_vae.safetensors"
+# ------------------------------------------------------------
+# Required assets (WAN AIO; GGUF removed)
+# ------------------------------------------------------------
+# WAN 2.2 AIO UNET (image-to-video rapid)
+dl_hf "Phr00t/WAN2.2-14B-Rapid-AllInOne" "wan2.2-i2v-rapid-aio.safetensors" \
+      "$MODELS/checkpoints/wan2.2-i2v-rapid-aio.safetensors"
 
-# Example LORAs / checkpoints by direct URL (uncomment + replace with real links)
-# dl_url "https://YOUR_HOST/flux_base.safetensors"      "$MODELS/checkpoints/flux_base.safetensors"
-# dl_url "https://YOUR_HOST/time_tale_lora.safetensors" "$MODELS/loras/time_tale_lora.safetensors"
-# dl_url "https://YOUR_HOST/ultrareal_v2.safetensors"   "$MODELS/loras/ultrareal_v2.safetensors"
+# WAN VAE & WAN text encoder used by CLIPLoader(type=wan)
+dl_hf "Phr00t/WAN2.2-14B-Rapid-AllInOne" "wan_2.1_vae.safetensors" \
+      "$MODELS/vae/wan_2.1_vae.safetensors"
+dl_hf "Phr00t/WAN2.2-14B-Rapid-AllInOne" "umt5_xxl_fp8_e4m3fn_scaled.safetensors" \
+      "$MODELS/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
 
-# Optional: load user-specified downloads from a file in the volume (no rebuild needed)
-# Lines format:
-#   hf repo_id|filename|subdir/filename[|revision]
-#   url https://...|subdir/filename
+# ESRGAN upscale model referenced by video upscaler node (skip if not in repo)
+dl_hf "Phr00t/WAN2.2-14B-Rapid-AllInOne" "4x_foolhardy_Remacri.pth" \
+      "$MODELS/upscale_models/4x_foolhardy_Remacri.pth" || true
+
+# ------------------------------------------------------------
+# Optional: user-provided list without rebuilding
+#   /workspace/models.user.txt lines support two formats:
+#     hf  repo_id|filename|subdir/filename[|revision]
+#     url https://...|subdir/filename
+# ------------------------------------------------------------
 USER_LIST="$BASE/models.user.txt"
 if [ -f "$USER_LIST" ]; then
   echo "[info] Found $USER_LIST — processing extra downloads"
@@ -75,15 +134,17 @@ if [ -f "$USER_LIST" ]; then
     if [ "$kind" = "hf" ]; then
       IFS='|' read -r repo fname rel rev <<< "$rest"
       [ -z "${rev:-}" ] && rev="main"
-      dl_hf "$repo" "$fname" "$MODELS/$rel" "$rev"
+      dl_hf "$repo" "$fname" "$MODELS/$rel" "$rev" || true
     elif [ "$kind" = "url" ]; then
       IFS='|' read -r url rel <<< "$rest"
-      dl_url "$url" "$MODELS/$rel"
+      dl_url "$url" "$MODELS/$rel" || true
     fi
   done < "$USER_LIST"
 fi
 
-# ---- Launch ComfyUI ----
+# ------------------------------------------------------------
+# Launch ComfyUI
+# ------------------------------------------------------------
 cd "$APP_DIR"
-echo "[run] ComfyUI on 0.0.0.0:$PORT"
+echo "[run] ComfyUI listening on 0.0.0.0:$PORT"
 exec python3 main.py --listen 0.0.0.0 --port "$PORT"
